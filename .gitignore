@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+out/
+*.npz
+.DS_Store
+.idea/
+.vscode/
+
+# stray export artefacts from a local run
+aor.shp
+aor.dbf
+aor.shx
+aor.prj
+.fault_downloads/

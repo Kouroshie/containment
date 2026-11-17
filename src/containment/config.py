@@ -1,0 +1,1239 @@
+"""Project definition: one YAML file that fully describes an AoR/PISC run.
+
+Everything the toolkit needs comes from a single, readable, version-
+controllable file.  That is not a convenience feature: 40 CFR 146.84(g)
+requires modelling inputs to be retained for ten years, and EPA asks that a
+submittal contain "all necessary information for the UIC Program Director to
+evaluate the AoR delineation results and replicate the computational modeling
+exercise" (Section 3.5).  A project file plus a version number is that.
+
+Values are written in whatever units the permit uses -- ``psi``, ``ft``,
+``mD``, ``MMT/yr`` -- and converted to SI once, here, so no downstream code
+has to guess.  See ``docs/input_schema.md`` for the annotated schema and
+``examples/`` for complete files.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+import numpy as np
+
+from . import fluids
+from . import units as U
+from .analytical.relperm import BrooksCorey, RelPerm, VanGenuchten
+
+
+# ==========================================================================
+def _get(d: dict, path: str, default=None):
+    cur: Any = d
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _need(d: dict, path: str):
+    v = _get(d, path, None)
+    if v is None:
+        raise ValueError(f"project file is missing required entry {path!r}")
+    return v
+
+
+# ==========================================================================
+@dataclass
+class Units:
+    """Units the project file is written in."""
+
+    length: str = "ft"
+    depth: str = "ft"
+    pressure: str = "psi"
+    temperature: str = "F"
+    permeability: str = "mD"
+    rate: str = "MMT/yr"
+    brine_rate: str = "bbl/day"
+    time: str = "yr"
+    compressibility: str = "1/psi"
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> Units:
+        return cls(**{k: v for k, v in (d or {}).items() if k in cls.__annotations__})
+
+
+@dataclass
+class Zone:
+    """A stratigraphic interval in SI units."""
+
+    name: str = ""
+    top_depth: float = float("nan")     # m below datum
+    base_depth: float = float("nan")
+    thickness: float = float("nan")     # m net
+    porosity: float = float("nan")
+    permeability: float = float("nan")  # m^2
+    temperature: float = float("nan")   # K
+    salinity: float = float("nan")      # NaCl mass fraction
+    initial_pressure: float = float("nan")   # Pa
+    rock_compressibility: float = float("nan")  # 1/Pa
+    dip_degrees: float = 0.0
+    dip_azimuth: float = 0.0
+    anisotropy_kv_kh: float = 0.1
+    # set on an interval made from a staged completion: the zone it is part of
+    stage_of: str = ""
+    lithology: str = ""              # sandstone | carbonate; picks the compressibility correlation
+    # A stacked zone may carry its own critical pressure and flow functions,
+    # as most multi-zone applications state them per zone. Unset, the zone
+    # takes the project's threshold section and relative_permeability.
+    threshold_override: float = float("nan")   # Pa
+    relperm: Any = None
+
+    @property
+    def mid_depth(self) -> float:
+        if np.isfinite(self.top_depth) and np.isfinite(self.base_depth):
+            return 0.5 * (self.top_depth + self.base_depth)
+        if np.isfinite(self.top_depth) and np.isfinite(self.thickness):
+            return self.top_depth + 0.5 * self.thickness
+        return self.top_depth
+
+
+@dataclass
+class WellSpec:
+    """One project well, in SI units."""
+
+    name: str
+    x: float
+    y: float
+    kind: str = "injector"
+    schedule: list[tuple[float, float]] = field(default_factory=list)
+    radius: float = 0.1
+    max_bhp: float = float("inf")
+    latitude: float = float("nan")
+    longitude: float = float("nan")
+    zone: str = ""          # injection zone completed; "" = all of them
+
+    def total_mass(self) -> float:
+        total, prev_t, prev_q = 0.0, None, 0.0
+        for t0, q in sorted(self.schedule):
+            if prev_t is not None:
+                total += prev_q * (t0 - prev_t)
+            prev_t, prev_q = t0, q
+        return max(total, 0.0)
+
+    def stop_time(self) -> float:
+        stops = [t for t, q in sorted(self.schedule) if q == 0.0]
+        return max(stops) if stops else max((t for t, _ in self.schedule), default=0.0)
+
+
+# ==========================================================================
+@dataclass
+class Project:
+    """A complete AoR/PISC project definition, converted to SI."""
+
+    name: str = "Unnamed project"
+    operator: str = ""
+    permit: str = ""
+    datum: str = "ground level"
+    notes: str = ""
+    # Calendar date injection starts, ISO "YYYY-MM-DD". Model time is always
+    # seconds from this instant; the date is carried so results can be read
+    # back in the years a permit is actually written in.
+    start_date: str = ""
+
+    injection_zone: Zone = field(default_factory=Zone)
+    confining_zone: Zone = field(default_factory=Zone)
+    usdw: Zone = field(default_factory=Zone)
+    # Offshore (Texas state waters): no USDW may be present, so this tool
+    # references the critical pressure to the mud line (seafloor) or to the base
+    # of the first permeable stratum below it [16 TAC 4.101, 5.206(b)(2)].
+    # When set, ``usdw`` holds that reference instead and this dict says so.
+    offshore: dict = field(default_factory=dict)
+    # Stacked completions: an operator may inject into two or more formations
+    # through one wellbore. Empty means the single zone above, which is what
+    # every existing project file describes.
+    injection_zones: list[Zone] = field(default_factory=list)
+    confining_zones: list[Zone] = field(default_factory=list)
+
+    relperm: RelPerm = field(default_factory=BrooksCorey)
+    wells: list[WellSpec] = field(default_factory=list)
+
+    threshold_method: str = "auto"
+    mud_weight_ppg: float = 9.0
+    gel_strength: float = 0.0            # Pa; not credited unless documented
+    mud_datum_depth: float = float("nan")
+    threshold_datum_depth: float = float("nan")  # m; where dP_c is evaluated
+    threshold_datum_top: bool = False    # evaluate at the top of each zone
+    threshold_override: float = float("nan")   # Pa
+
+    engine: str = "analytical"       # analytical | ve | import
+    grid_nx: int = 121
+    grid_ny: int = 121
+    cell_size: float = U.length(500.0, "ft")
+    grid_half_width: float = float("nan")       # m, total domain half-width
+    grid_fine_half_width: float = float("nan")  # m, extent of the fine cells
+    grid_growth: float = 1.12
+    boundary: str = "infinite"
+    end_time: float = U.time(70.0, "yr")
+    output_times: np.ndarray = field(default_factory=lambda: U.time(
+        np.array([0, 1, 2, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70.0]), "yr"))
+    output_times_given: bool = False      # model.output_years set in the file
+
+    plume_criterion: str = "CO2 column-averaged saturation >= 0.01"
+    plume_cutoff: float = 0.01
+    # inputs filled from reference_defaults: [{input, value, basis}]
+    defaults_used: list = field(default_factory=list)
+    # 40 CFR 146.84(e): the AoR is re-evaluated at least this often.
+    aor_reevaluation_years: float = 5.0
+
+    penetrations_csv: str = ""
+    penetrations_unit: str = "m"
+
+    faults: list[dict] = field(default_factory=list)
+
+    crs: dict = field(default_factory=dict)
+    uncertainty: dict = field(default_factory=dict)
+    raw: dict = field(default_factory=dict)
+    units: Units = field(default_factory=Units)
+    warnings: list[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_dict(cls, d: dict) -> Project:
+        d = copy.deepcopy(d)
+        un = Units.from_dict(d.get("units"))
+        p = cls(raw=copy.deepcopy(d), units=un)
+        staged_notes = _expand_staged_intervals(d)
+
+        pr = d.get("project", {})
+        p.name = pr.get("name", p.name)
+        p.operator = pr.get("operator", "")
+        p.permit = pr.get("permit", "")
+        p.datum = pr.get("datum", p.datum)
+        p.notes = pr.get("notes", "")
+        p.crs = pr.get("crs", {}) or {}
+        p.start_date = str(pr.get("start_date") or "")[:10]
+
+        def zone(key: str, name: str) -> Zone:
+            z = d.get("formation", {}).get(key, {}) or {}
+            out = Zone(name=name)
+            if "top_depth" in z:
+                out.top_depth = U.length(float(z["top_depth"]), un.depth)
+            if "base_depth" in z:
+                out.base_depth = U.length(float(z["base_depth"]), un.depth)
+            if "thickness" in z:
+                out.thickness = U.length(float(z["thickness"]), un.length)
+            elif np.isfinite(out.top_depth) and np.isfinite(out.base_depth):
+                out.thickness = out.base_depth - out.top_depth
+            for src, dst, conv in (
+                ("porosity", "porosity", lambda v: float(v)),
+                ("permeability", "permeability", lambda v: U.permeability(float(v), un.permeability)),
+                ("temperature", "temperature", lambda v: U.temperature(float(v), un.temperature)),
+                ("initial_pressure", "initial_pressure", lambda v: U.pressure(float(v), un.pressure)),
+                ("rock_compressibility", "rock_compressibility",
+                 lambda v: U.compressibility(float(v), un.compressibility)),
+                ("dip_degrees", "dip_degrees", float),
+                ("dip_azimuth", "dip_azimuth", float),
+                ("anisotropy_kv_kh", "anisotropy_kv_kh", float),
+            ):
+                if src in z and z[src] is not None:
+                    setattr(out, dst, conv(z[src]))
+            if "salinity_ppm" in z:
+                out.salinity = fluids.salinity_to_mass_fraction(float(z["salinity_ppm"]), "ppm")
+            elif "salinity" in z:
+                out.salinity = fluids.salinity_to_mass_fraction(
+                    float(z["salinity"]), z.get("salinity_unit", "ppm"))
+            out.lithology = str(z.get("lithology") or "")
+            return out
+
+        p.injection_zone = zone("injection_zone", "injection zone")
+        p.confining_zone = zone("confining_zone", "confining zone")
+        p.usdw = zone("usdw", "lowermost USDW")
+        od = {k: v for k, v in (d.get("offshore") or {}).items()
+              if v is not None and str(v).strip() != ""}
+        if od:                      # a blank Offshore sheet means onshore
+            _apply_offshore(p, od, un)
+
+        # formation.injection_zones: a list of stacked intervals, each able to
+        # carry its own confining zone. The singular key stays the one-zone
+        # spelling, so no existing project file changes meaning.
+        stacked = d.get("formation", {}).get("injection_zones") or []
+        for k, zd in enumerate(stacked):
+            nm = str(zd.get("name") or f"zone {k + 1}")
+            p.injection_zones.append(_zone_from_dict(zd, un, nm))
+            czd = zd.get("confining_zone")
+            p.confining_zones.append(
+                _zone_from_dict(czd, un, f"{nm} confining zone") if czd
+                else p.confining_zone)
+        if len(p.injection_zones) == 1:
+            # one entry in the list is just the single-zone case spelled out
+            p.injection_zone = p.injection_zones[0]
+            p.confining_zone = p.confining_zones[0]
+            p.injection_zones, p.confining_zones = [], []
+        elif p.injection_zones:
+            p.injection_zone = p.injection_zones[0]
+            p.confining_zone = p.confining_zones[0]
+
+        rp = d.get("relative_permeability", {}) or {}
+        from . import reference_defaults as REF
+        rp_missing = [k for k in ("swr", "sgr", "krg0", "krw0", "m", "n")
+                      if rp.get(k) is None or str(rp.get(k)).strip() == ""]
+        if not str(rp.get("model", "brooks_corey")).lower().startswith("van"):
+            rp = {**rp, **{k: REF.RELPERM[k][0] for k in rp_missing}}
+        p.relperm = _relperm_from_dict(rp)
+        zone_dicts = stacked or [d.get("formation", {}).get("injection_zone") or {}]
+        # per-zone flow functions: the zone's keys over the project's
+        for z, zd in zip(p.injection_zones or [p.injection_zone],
+                         zone_dicts, strict=False):
+            zrp = {k: v for k, v in ((zd or {}).get("relative_permeability") or {}).items()
+                   if not _blank(v)}
+            if zrp:
+                z.relperm = _relperm_from_dict({**rp, **zrp})
+        if not p.injection_zones and p.injection_zone.relperm is not None:
+            p.relperm = p.injection_zone.relperm
+
+        origin = _project_origin(d)
+        if origin and not p.start_date:
+            p.start_date = origin
+        for w in d.get("wells", []) or []:
+            p.wells.append(_well_from_dict(w, un, origin))
+        p._resolve_geography()
+        p._parse_faults(d.get("faults") or [])
+
+        th = d.get("threshold", {}) or {}
+        for z, zd in zip(p.injection_zones or [p.injection_zone],
+                         zone_dicts, strict=False):
+            v = (zd or {}).get("threshold_override")
+            if not _blank(v):
+                z.threshold_override = U.pressure(float(v), un.pressure)
+        p.threshold_method = str(th.get("method", "auto")).lower()
+        p.mud_weight_ppg = float(th.get("mud_weight_ppg", 9.0))
+        gel_given = th.get("gel_strength") is not None
+        p.gel_strength = (U.pressure(float(th["gel_strength"]), un.pressure) if gel_given
+                          else U.pressure(REF.GEL_STRENGTH_PSI[0], "psi"))
+        if th.get("mud_datum_depth") is not None:
+            p.mud_datum_depth = U.length(float(th["mud_datum_depth"]), un.depth)
+        if th.get("datum_depth") is not None:
+            p.threshold_datum_depth = U.length(float(th["datum_depth"]), un.depth)
+        elif th.get("datum") in ("top", "top_of_injection_zone"):
+            # Kept as a choice, not a depth: on a stacked completion every
+            # zone is evaluated at its own top.
+            p.threshold_datum_top = True
+        if th.get("override") is not None:
+            p.threshold_override = U.pressure(float(th["override"]), un.pressure)
+
+        mo = d.get("model", {}) or {}
+        p.engine = str(mo.get("engine", "analytical")).lower()
+        grid = mo.get("grid", {}) or {}
+        p.grid_nx = int(grid.get("nx", 121))
+        p.grid_ny = int(grid.get("ny", 121))
+        p.cell_size = U.length(float(grid.get("cell_size", 500.0)), un.length)
+        if grid.get("half_width") is not None:
+            p.grid_half_width = U.length(float(grid["half_width"]), un.length)
+        if grid.get("fine_half_width") is not None:
+            p.grid_fine_half_width = U.length(float(grid["fine_half_width"]), un.length)
+        p.grid_growth = float(grid.get("growth", 1.12))
+        p.boundary = str(mo.get("boundary", "infinite")).lower()
+        end_given = mo.get("end_year") is not None
+        p.end_time = (U.time(float(mo["end_year"]), un.time) if end_given
+                      else p.injection_end() + U.time(REF.PISC_YEARS[0], "yr"))
+        if mo.get("output_years"):
+            p.output_times = U.time(np.asarray(mo["output_years"], float), un.time)
+            p.output_times_given = True
+        else:
+            p.output_times = _default_output_times(p.end_time, p.wells)
+
+        p.aor_reevaluation_years = float(mo.get("aor_reevaluation_years", 5.0))
+
+        pl = d.get("plume", {}) or {}
+        p.plume_cutoff = float(pl.get("cutoff", 0.01))
+        p.plume_criterion = pl.get(
+            "criterion", f"CO2 column-averaged saturation >= {p.plume_cutoff:g}")
+
+        pen = d.get("penetrations", {}) or {}
+        p.penetrations_csv = pen.get("csv", "")
+        p.penetrations_unit = pen.get("coordinate_unit", "m")
+
+        p.uncertainty = dict(d.get("uncertainty", {}) or {})
+        if isinstance(p.uncertainty.get("enabled"), str):   # typed into a spreadsheet
+            p.uncertainty["enabled"] = (p.uncertainty["enabled"].strip().lower()
+                                        in ("true", "yes", "y", "1", "on"))
+        p.warnings.extend(staged_notes)
+        p.warnings.extend(d.get("workbook_notes") or [])
+        p._fill_reference_defaults(rp_missing=rp_missing, gel_given=gel_given,
+                                   end_given=end_given)
+        p.validate()
+        return p
+
+    @classmethod
+    def from_yaml(cls, path: str) -> Project:
+        import yaml
+
+        with open(path, encoding="utf-8") as fh:
+            return cls.from_dict(yaml.safe_load(fh) or {})
+
+    @classmethod
+    def from_excel(cls, path: str) -> Project:
+        """Read a project from the workbook :mod:`containment.io.workbook` writes."""
+        from .io.workbook import from_excel
+
+        return cls.from_dict(from_excel(path))
+
+    @classmethod
+    def load(cls, path: str) -> Project:
+        """Read a project from whichever format the file is in.
+
+        YAML is the record a reviewer wants; the workbook is the one a team
+        will actually fill in. Both describe the same project, so the loader
+        takes either rather than making the caller care.
+        """
+        import os
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".xlsx", ".xlsm"):
+            return cls.from_excel(path)
+        return cls.from_yaml(path)
+
+    # ------------------------------------------------------------------ #
+    def _parse_faults(self, spec: list) -> None:
+        """Read sealing or partly-sealing fault traces from the project file.
+
+        A fault that holds is often the thing that *sets* the AoR boundary on
+        one side -- several Gulf Coast applications say so explicitly -- so a
+        model that cannot represent one will over-predict in that direction.
+        Traces are given either as ``points`` in the project length unit, or as
+        ``latlon`` pairs, which are converted through the project frame.
+        """
+        from .io.exporters import LocalCRS
+
+        self.faults = []
+        crs = None
+        if self.crs.get("epsg") or self.crs.get("origin_lon") is not None:
+            try:
+                crs = LocalCRS(epsg=self.crs.get("epsg"),
+                               origin_lon=self.crs.get("origin_lon"),
+                               origin_lat=self.crs.get("origin_lat"),
+                               x_offset=float(self.crs.get("x_offset", 0.0)),
+                               y_offset=float(self.crs.get("y_offset", 0.0)))
+            except Exception:
+                crs = None
+
+        for k, f in enumerate(spec):
+            name = str(f.get("name") or f"fault {k + 1}")
+            mult = float(f.get("multiplier", 0.0))
+            pts = []
+            if f.get("latlon"):
+                if crs is None:
+                    self.warnings.append(
+                        f"fault {name!r} is given in latitude/longitude but the "
+                        "project has no georeferencing; the fault was ignored")
+                    continue
+                lon = np.array([float(q[1]) for q in f["latlon"]])
+                lat = np.array([float(q[0]) for q in f["latlon"]])
+                fx, fy = crs.from_lonlat(lon, lat)
+                pts = [(float(a), float(b)) for a, b in zip(fx, fy, strict=True)]
+            else:
+                for q in f.get("points") or []:
+                    pts.append((U.length(float(q[0]), self.units.length),
+                                U.length(float(q[1]), self.units.length)))
+            if len(pts) < 2:
+                self.warnings.append(f"fault {name!r} needs at least two points")
+                continue
+            if not 0.0 <= mult <= 1.0:
+                self.warnings.append(
+                    f"fault {name!r} has multiplier {mult}; expected 0 (sealing) to 1 (open)")
+            self.faults.append({"name": name, "multiplier": mult, "points": pts})
+
+    # ------------------------------------------------------------------ #
+    def _resolve_geography(self) -> None:
+        """Reconcile latitude/longitude well positions with the local frame.
+
+        Site data arrives as latitude and longitude, not as metres from an
+        arbitrary origin, so a project may give either. When lat/lon is
+        supplied the local frame is built around the wells automatically and
+        the map transform falls out of it, which is what makes a GIS map
+        possible without the user computing anything.
+        """
+        from .io.exporters import HAVE_PYPROJ, LocalCRS
+
+        geo = [w for w in self.wells
+               if np.isfinite(w.latitude) and np.isfinite(w.longitude)]
+        if not geo:
+            return
+
+        lat0 = float(np.mean([w.latitude for w in geo]))
+        lon0 = float(np.mean([w.longitude for w in geo]))
+
+        if self.crs.get("epsg"):
+            crs = LocalCRS(epsg=int(self.crs["epsg"]))
+        elif HAVE_PYPROJ:
+            # the UTM zone the well field falls in: exact, and metres
+            zone = int((lon0 + 180.0) // 6.0) + 1
+            epsg = (32600 if lat0 >= 0 else 32700) + zone
+            crs = LocalCRS(epsg=epsg)
+            self.crs = {"epsg": epsg,
+                        "note": f"UTM zone {zone}{'N' if lat0 >= 0 else 'S'}, "
+                                "chosen automatically from the well locations"}
+        else:
+            crs = LocalCRS(origin_lon=lon0, origin_lat=lat0)
+            self.crs = {"origin_lon": lon0, "origin_lat": lat0,
+                        "note": "local tangent plane about the well field; "
+                                "install pyproj for an exact UTM transform"}
+
+        # Place the origin of the local frame at the centre of the well field,
+        # unless the project pinned it. Pinning matters when one site is
+        # modelled as several projects (one per storage formation): they have
+        # to share a frame or their polygons will not line up when combined.
+        if self.crs.get("x_offset") is not None:
+            crs.x_offset = float(self.crs["x_offset"])
+            crs.y_offset = float(self.crs.get("y_offset", 0.0))
+        else:
+            # the offsets live in the CRS's own units, not in model metres,
+            # so that a pinned frame reads like an easting off a plat
+            ox, oy = crs.from_lonlat(np.array([lon0]), np.array([lat0]))
+            crs.x_offset = float(ox[0]) / crs.unit_to_m
+            crs.y_offset = float(oy[0]) / crs.unit_to_m
+        self.crs = dict(self.crs, x_offset=crs.x_offset, y_offset=crs.y_offset)
+
+        for w in self.wells:
+            if np.isfinite(w.latitude) and np.isfinite(w.longitude):
+                x, y = crs.from_lonlat(np.array([w.longitude]), np.array([w.latitude]))
+                w.x, w.y = float(x[0]), float(y[0])
+            elif not (np.isfinite(w.x) and np.isfinite(w.y)):
+                self.warnings.append(
+                    f"well {w.name!r} has neither x/y nor latitude/longitude")
+
+    @property
+    def zones(self) -> list[Zone]:
+        """Every injection zone, whether the project gave one or several."""
+        return list(self.injection_zones) if self.injection_zones else [self.injection_zone]
+
+    @property
+    def seals(self) -> list[Zone]:
+        """The confining zone above each injection zone, index for index."""
+        if self.injection_zones:
+            return list(self.confining_zones)
+        return [self.confining_zone]
+
+    @property
+    def is_stacked(self) -> bool:
+        return len(self.zones) > 1
+
+    def zone_wells(self, index: int) -> list[WellSpec]:
+        """The wells that inject into zone ``index``, with rates allocated.
+
+        A well may name the zone it is completed in, in which case its whole
+        rate goes there. A well that names none is treated as a commingled
+        completion open to every zone, and its rate is split in proportion to
+        flow capacity ``k*h``, which is where the fluid actually goes when one
+        tubing string feeds several perforated intervals. That split is an
+        assumption, not a measurement: a project that has zonal rate
+        allocation from a distributed-temperature or spinner survey should
+        state the rates per zone explicitly instead.
+        """
+        zones = self.zones
+        z = zones[index]
+        if len(zones) == 1:
+            return list(self.wells)
+
+        # an interval cut from a staged completion only takes the wells moved
+        # into it, never a share of a commingled rate
+        open_to_all = [zz for zz in zones if not zz.stage_of]
+        kh = [float(zz.permeability) * float(zz.thickness) for zz in open_to_all]
+        good = [v for v in kh if np.isfinite(v) and v > 0]
+        if z.stage_of:
+            share = 0.0
+        elif len(good) == len(kh) and sum(good) > 0:
+            share = float(z.permeability) * float(z.thickness) / sum(kh)
+        else:
+            share = 1.0 / max(len(open_to_all), 1)
+
+        want = (z.name or "").strip().lower()
+        out: list[WellSpec] = []
+        for w in self.wells:
+            target = (w.zone or "").strip().lower()
+            if target and target != want:
+                continue
+            f = 1.0 if target else share
+            if f == 0.0:
+                continue
+            out.append(replace(w, schedule=[(t, q * f) for t, q in w.schedule]))
+        return out
+
+    def zone_allocation(self) -> list[dict]:
+        """How each zone's share of a commingled rate was arrived at."""
+        zones = self.zones
+        kh = [0.0 if zz.stage_of else float(zz.permeability) * float(zz.thickness)
+              for zz in zones]
+        total = sum(v for v in kh if np.isfinite(v) and v > 0)
+        n_open = max(sum(1 for zz in zones if not zz.stage_of), 1)
+        rows = []
+        for i, z in enumerate(zones):
+            share = (0.0 if z.stage_of else
+                     kh[i] / total if total > 0 and np.isfinite(kh[i])
+                     else 1.0 / n_open)
+            rows.append({
+                "zone": z.name or f"zone {i + 1}",
+                "top_depth_ft": U.length_out(z.top_depth, "ft"),
+                "net_thickness_ft": U.length_out(z.thickness, "ft"),
+                "permeability_mD": U.permeability_out(z.permeability, "mD"),
+                "kh_share_percent": 100.0 * share,
+                "named_completions": sum(
+                    1 for w in self.wells
+                    if (w.zone or "").strip().lower() == (z.name or "").strip().lower()),
+            })
+        return rows
+
+    # ------------------------------------------------------------------ #
+    def validate(self) -> list[str]:
+        """Check the things that silently ruin an AoR if they are wrong."""
+        w = self.warnings
+        iz, cz, us = self.injection_zone, self.confining_zone, self.usdw
+
+        if not self.wells:
+            w.append("no wells defined: there is nothing to model")
+        if not any(x.kind == "injector" for x in self.wells):
+            w.append("no injector defined")
+
+        if np.isfinite(iz.top_depth) and np.isfinite(us.base_depth) \
+                and iz.top_depth <= us.base_depth:
+            w.append(
+                f"the injection zone is not below the {self.reference_label}; check the "
+                "depth datum and sign convention (depths are positive downward)")
+        if np.isfinite(cz.base_depth) and np.isfinite(iz.top_depth) \
+                and cz.base_depth > iz.top_depth + 1.0:
+            w.append("the confining zone base is below the injection zone top; "
+                     "these intervals overlap")
+        if not np.isfinite(iz.initial_pressure):
+            w.append("injection-zone initial pressure is missing; the threshold "
+                     "pressure cannot be computed")
+        if not np.isfinite(us.initial_pressure) and not self.offshore:
+            w.append("USDW initial pressure is missing; EPA Method 1 needs it "
+                     "(hydrostatic at the USDW base is a common substitute -- "
+                     "state the assumption)")
+        if not np.isfinite(iz.thickness) or iz.thickness <= 0:
+            w.append("injection-zone net thickness is missing or non-positive")
+        if np.isfinite(iz.porosity) and not 0 < iz.porosity < 1:
+            w.append(f"porosity {iz.porosity} is outside (0, 1)")
+
+        if self.is_stacked:
+            names = [(z.name or "").strip().lower() for z in self.zones]
+            if len(set(names)) != len(names):
+                w.append("two injection zones share a name; zone names are how "
+                         "wells say which interval they are completed in")
+            for k, z in enumerate(self.zones):
+                if not np.isfinite(z.initial_pressure):
+                    w.append(f"zone {z.name!r} has no initial pressure, so it "
+                             "gets its own threshold pressure from no data")
+                if not np.isfinite(z.thickness) or z.thickness <= 0:
+                    w.append(f"zone {z.name!r} has no net thickness")
+                if k and np.isfinite(z.top_depth) and np.isfinite(self.zones[k - 1].top_depth) \
+                        and z.top_depth < self.zones[k - 1].top_depth:
+                    w.append("injection zones are not ordered by depth; list "
+                             "them shallowest first so the stack reads in order")
+            named = {(x.zone or "").strip().lower() for x in self.wells if x.zone}
+            unknown = named - set(names)
+            if unknown:
+                w.append(f"wells name injection zones that do not exist: "
+                         f"{sorted(unknown)}")
+            if not named:
+                w.append(
+                    f"no well names an injection zone, so the rate of each is "
+                    f"split across the {len(self.zones)} zones in proportion to "
+                    "k*h. Give per-zone rates if you have a zonal allocation "
+                    "survey.")
+
+        w.extend(self._range_checks())
+
+        domain = (2.0 * self.grid_half_width if np.isfinite(self.grid_half_width)
+                  else self.grid_nx * self.cell_size)
+        if self.engine == "ve" and domain < U.length(5.0, "mi"):
+            w.append(
+                f"the VE grid spans only {U.length_out(domain, 'mi'):.1f} mi; "
+                "confirm the domain extends well beyond the pressure front "
+                "[EPA Section 3.3.3.2]")
+        if self.engine == "ve" and self.boundary == "noflow" \
+                and self.end_time > U.time(30, "yr"):
+            w.append(
+                "a fully closed (no-flow) domain never lets pressure dissipate, "
+                "so the post-injection pressure front will never shrink. Use a "
+                "larger domain or constant-pressure boundaries for PISC work "
+                "unless the reservoir really is compartmentalised.")
+        return w
+
+    def _fill_reference_defaults(self, *, rp_missing=(), gel_given=True,
+                                 end_given=True) -> None:
+        """Fill inputs the application left blank from reference_defaults, and
+        record each one with its basis in ``defaults_used`` and the warnings."""
+        from . import reference_defaults as REF
+
+        used = self.defaults_used
+        reg = REF.region([w.longitude for w in self.wells])
+
+        def note(item, value, basis):
+            used.append({"input": item, "value": value, "basis": basis})
+
+        zones = self.zones if self.is_stacked else [self.injection_zone]
+        for z in zones:
+            tag = f" ({z.name})" if self.is_stacked else ""
+            if not np.isfinite(z.salinity):
+                z.salinity = fluids.salinity_to_mass_fraction(
+                    REF.INJECTION_ZONE_SALINITY_PPM[0], "ppm")
+                note("injection zone salinity" + tag,
+                     f"{REF.INJECTION_ZONE_SALINITY_PPM[0]:,.0f} ppm",
+                     REF.INJECTION_ZONE_SALINITY_PPM[1])
+            if not np.isfinite(z.temperature) and np.isfinite(z.top_depth):
+                z.temperature, basis = REF.temperature(z.mid_depth, reg)
+                note("injection zone temperature" + tag,
+                     f"{U.temperature_out(z.temperature, 'F'):,.0f} degF at mid-zone", basis)
+            if not np.isfinite(z.initial_pressure) and np.isfinite(z.top_depth) \
+                    and not self.offshore:
+                z.initial_pressure, basis = REF.hydrostatic_pressure(z.top_depth, z.salinity, reg)
+                note("injection zone initial pressure" + tag,
+                     f"{U.pressure_out(z.initial_pressure, 'psi'):,.0f} psi at the top", basis
+                     + ("; Permian reservoirs are often depleted or over-pressured by offset "
+                        "production and disposal, so a measured pressure is much better"
+                        if reg == "west_texas" else ""))
+            if not np.isfinite(z.rock_compressibility):
+                z.rock_compressibility, basis = REF.rock_compressibility(z.porosity, z.lithology)
+                note("rock compressibility" + tag,
+                     f"{U.compressibility_out(z.rock_compressibility, '1/psi'):.2e} 1/psi", basis)
+
+        us = self.usdw
+        if not self.offshore and np.isfinite(us.base_depth):
+            if not np.isfinite(us.salinity):
+                us.salinity = fluids.salinity_to_mass_fraction(REF.USDW_SALINITY_PPM[0], "ppm")
+                note("USDW salinity", f"{REF.USDW_SALINITY_PPM[0]:,.0f} ppm",
+                     REF.USDW_SALINITY_PPM[1])
+            if not np.isfinite(us.temperature):
+                us.temperature, basis = REF.temperature(us.base_depth, reg)
+                note("USDW temperature", f"{U.temperature_out(us.temperature, 'F'):,.0f} degF",
+                     basis)
+            if not np.isfinite(us.initial_pressure):
+                us.initial_pressure, basis = REF.hydrostatic_pressure(
+                    us.base_depth, us.salinity, reg)
+                note("USDW pressure", f"{U.pressure_out(us.initial_pressure, 'psi'):,.0f} psi",
+                     basis)
+
+        for k in rp_missing:
+            note(f"relative permeability {k}", f"{REF.RELPERM[k][0]:g}", REF.RELPERM[k][1])
+        if not gel_given:
+            note("mud gel strength", "0 psi", REF.GEL_STRENGTH_PSI[1])
+        if not end_given:
+            note("simulation end",
+                 f"year {U.time_out(self.end_time, 'yr'):,.1f} (last injection + 50 years)",
+                 REF.PISC_YEARS[1])
+        if used:
+            self.warnings.append(
+                f"{len(used)} input(s) were not given and were filled with reference values "
+                f"({REF.REGIONS[reg]['label']}): "
+                + "; ".join(f"{u['input']} = {u['value']}" for u in used)
+                + ". Replace them with the application's values where it gives them; the "
+                "sources are in the run summary.")
+
+    def _range_checks(self) -> list[str]:
+        """Inputs outside the plausible range in inputs_guide: usually a typo or
+        a unit slip (porosity in percent, permeability in darcies, depth in m)."""
+        from . import inputs_guide as ig
+
+        out: list[str] = []
+
+        def chk(key, value, where=""):
+            if value is None or not np.isfinite(value):
+                return
+            msg = ig.check_value(key, float(value))
+            if msg:
+                out.append(msg + (f" ({where})" if where else ""))
+
+        zones = self.zones if self.is_stacked else [self.injection_zone]
+        for z in zones:
+            where = z.name if self.is_stacked else ""
+            top = U.length_out(z.top_depth, "ft")
+            chk("iz_top", top, where)
+            chk("iz_h", U.length_out(z.thickness, "ft"), where)
+            chk("iz_phi", z.porosity, where)
+            chk("iz_k", U.permeability_out(z.permeability, "mD"), where)
+            chk("iz_s", z.salinity * 1e6 if np.isfinite(z.salinity) else None, where)
+            if np.isfinite(top) and top > 0 and not self.offshore:
+                chk("iz_p", U.pressure_out(z.initial_pressure, "psi") / top, where)
+            chk("iz_dip", z.dip_degrees, where)
+            chk("iz_kvkh", z.anisotropy_kv_kh, where)
+            chk("iz_cr", U.compressibility_out(z.rock_compressibility, "1/psi"), where)
+        if not self.offshore:
+            chk("usdw_base", U.length_out(self.usdw.base_depth, "ft"))
+        rp = self.relperm
+        for key, attr in (("swr", "swr"), ("sgr", "sgr"), ("krg0", "krg0"), ("krw0", "krw0"),
+                          ("corey_w", "m"), ("corey_g", "n")):
+            chk(key, getattr(rp, attr, None))
+        for wl in self.wells:
+            if wl.kind != "injector":
+                continue
+            peak = max((q for _, q in wl.schedule), default=0.0)
+            if peak > 0:
+                chk("rate", U.mass_rate_out(peak, "MMT/yr"), wl.name)
+        chk("cutoff", self.plume_cutoff)
+        return out
+
+    # ------------------------------------------------------------------ #
+    @property
+    def reference_label(self) -> str:
+        """What the critical pressure is measured against, in words."""
+        return self.offshore.get("label", "lowermost USDW") if self.offshore \
+            else "lowermost USDW"
+
+    def fluid_state(self) -> fluids.FluidState:
+        iz = self.injection_zone
+        return fluids.evaluate(iz.initial_pressure, iz.temperature, iz.salinity)
+
+    def usdw_fluid_state(self) -> fluids.FluidState:
+        us = self.usdw
+        t = us.temperature if np.isfinite(us.temperature) else U.temperature(70, "F")
+        s = us.salinity if np.isfinite(us.salinity) else 0.0005
+        p = (us.initial_pressure if np.isfinite(us.initial_pressure)
+             else fluids.hydrostatic_pressure(us.base_depth))
+        return fluids.evaluate(p, t, s)
+
+    def total_compressibility(self) -> float:
+        fs = self.fluid_state()
+        rock = (self.injection_zone.rock_compressibility
+                if np.isfinite(self.injection_zone.rock_compressibility)
+                else U.compressibility(4e-6, "1/psi"))
+        return rock + fs.c_brine
+
+    @property
+    def threshold_depth(self) -> float:
+        """Depth at which the threshold pressure is evaluated.
+
+        Defaults to the mid-point of the injection zone.  Applications
+        commonly quote it at the **top** of the injection zone instead, which
+        is where the topmost perforation and the shallowest possible conduit
+        connection are.  The difference is not cosmetic: moving the datum from
+        the mid-perforation to the top of a 300 ft interval changes dP_c by
+        the weight of 150 ft of brine, which on a typical under-pressurised
+        site is 10 % or more of the answer.  Set ``threshold.datum_depth``
+        (or ``threshold.datum: top``) to control it, and state the choice.
+        """
+        if np.isfinite(self.threshold_datum_depth):
+            return self.threshold_datum_depth
+        if self.threshold_datum_top:
+            return self.injection_zone.top_depth
+        return self.injection_zone.mid_depth
+
+    def injection_end(self) -> float:
+        return max((w.stop_time() for w in self.wells if w.kind == "injector"),
+                   default=0.0)
+
+    def calendar(self, t: float):
+        """The calendar date at model time ``t`` seconds, or None."""
+        import datetime as _dt
+
+        origin = _parse_date(self.start_date)
+        if origin is None:
+            return None
+        return origin + _dt.timedelta(days=U.time_out(float(t), "yr") * 365.25)
+
+    def calendar_year(self, t: float):
+        """The calendar year at model time ``t``, or None if undated."""
+        d = self.calendar(t)
+        return d.year if d is not None else None
+
+    def total_injected_mass(self) -> float:
+        return sum(w.total_mass() for w in self.wells if w.kind == "injector")
+
+    def summary(self) -> dict:
+        iz = self.injection_zone
+        return {
+            "project": self.name,
+            "operator": self.operator,
+            "permit": self.permit,
+            "datum": self.datum,
+            "injectors": sum(1 for w in self.wells if w.kind == "injector"),
+            "extractors": sum(1 for w in self.wells if w.kind == "extractor"),
+            "total_injected_MMT": U.mass_out(self.total_injected_mass(), "MMT"),
+            "injection_end_year": U.time_out(self.injection_end(), "yr"),
+            "simulation_end_year": U.time_out(self.end_time, "yr"),
+            "injection_zone_top_ft": U.length_out(iz.top_depth, "ft"),
+            "injection_zone_thickness_ft": U.length_out(iz.thickness, "ft"),
+            "injection_zone_permeability_mD": U.permeability_out(iz.permeability, "mD"),
+            "injection_zone_porosity": iz.porosity,
+            "usdw_base_ft": (U.length_out(self.usdw.base_depth, "ft")
+                             if not self.offshore else None),
+            "critical_pressure_reference": self.reference_label,
+            "critical_pressure_reference_depth_ft": U.length_out(self.usdw.base_depth, "ft"),
+            **({"offshore": self.offshore_summary()} if self.offshore else {}),
+            "threshold_datum_ft": U.length_out(self.threshold_depth, "ft"),
+            "engine": self.engine,
+            "plume_criterion": self.plume_criterion,
+            "warnings": list(self.warnings),
+        }
+
+    def offshore_summary(self) -> dict:
+        o = self.offshore
+        return {
+            "water_depth_ft": U.length_out(o["water_depth"], "ft"),
+            "reference": o["label"],
+            "reference_depth_ft": U.length_out(self.usdw.base_depth, "ft"),
+            "reference_pressure_psi": U.pressure_out(self.usdw.initial_pressure, "psi"),
+            **({"compared": o["comparison"]} if o.get("comparison") else {}),
+            "basis": OFFSHORE_BASIS,
+        }
+
+    def to_dict(self) -> dict:
+        return copy.deepcopy(self.raw)
+
+
+# ==========================================================================
+SEAWATER_DENSITY = 1025.0          # kg/m3; x g = 10,052 Pa/m = 0.444 psi/ft
+SEAWATER_SALINITY_PPM = 35000.0
+OFFSHORE_BASIS = (
+    "Offshore: no USDW may be present, so the critical pressure is referenced to "
+    "the deepest depth needed to prevent any discharge to the seafloor "
+    "(16 TAC 4.101; 16 TAC 5.206(b)(2) protects surface water, "
+    "including the Gulf, as well as USDWs). The pressure front therefore marks "
+    "where a conduit could carry formation fluid or CO2 to the seafloor.")
+OFFSHORE_REFERENCES = {
+    "mud_line": "mud line (seafloor)",
+    "first_permeable": "base of the first permeable stratum below the mud line",
+}
+# 'most_protective' computes the threshold against both and keeps the lower:
+# the aim is "the deepest depth necessary to ensure no discharge to the
+# seafloor", and the lower critical pressure is the larger, safer AoR.
+OFFSHORE_CHOICES = [*OFFSHORE_REFERENCES, "most_protective"]
+
+
+def _apply_offshore(p: Project, od: dict, un: Units) -> None:
+    """Replace the USDW with the offshore critical-pressure reference.
+
+    ``offshore.water_depth`` (sea level to the mud line, in the depth unit) is
+    required, and depths are then measured from sea level. ``reference`` is
+    ``mud_line`` (default) or ``first_permeable``, which needs
+    ``first_permeable_base``; ``most_protective`` (the default whenever
+    ``first_permeable_base`` is given) keeps both, and the run uses whichever
+    gives the lower critical pressure. Pressure defaults to a seawater column from sea
+    level (1,025 kg/m3, 0.444 psi/ft) plus one atmosphere; salinity to
+    seawater; temperature to ``seafloor_temperature`` (default 70 degF).
+    """
+    if od.get("water_depth") is None:
+        raise ValueError("offshore.water_depth is required (sea level to the mud line)")
+    has_fp = od.get("first_permeable_base") is not None
+    ref = str(od.get("reference") or ("most_protective" if has_fp else "mud_line")
+              ).strip().lower().replace(" ", "_")
+    if ref not in OFFSHORE_CHOICES:
+        raise ValueError(f"offshore.reference must be one of {OFFSHORE_CHOICES}")
+    wd = U.length(float(od["water_depth"]), un.depth)
+    if ref in ("first_permeable", "most_protective") and not has_fp:
+        raise ValueError(f"offshore.reference {ref} needs offshore.first_permeable_base")
+    if has_fp and U.length(float(od["first_permeable_base"]), un.depth) <= wd:
+        raise ValueError("offshore.first_permeable_base must be below the mud line "
+                         "(deeper than water_depth)")
+    if np.isfinite(p.usdw.base_depth):
+        p.warnings.append(
+            "offshore and usdw are both given: the offshore reference is used "
+            "for offshore applications; run again without "
+            "'offshore' to compare with the USDW")
+
+    def reference_zone(key: str) -> Zone:
+        depth = (wd if key == "mud_line"
+                 else U.length(float(od["first_permeable_base"]), un.depth))
+        z = Zone(name=OFFSHORE_REFERENCES[key])
+        z.base_depth = z.top_depth = depth
+        pk = "first_permeable_pressure" if key == "first_permeable" else "mud_line_pressure"
+        z.initial_pressure = (
+            U.pressure(float(od[pk]), un.pressure) if od.get(pk) is not None
+            else fluids.hydrostatic_pressure(depth, gradient=SEAWATER_DENSITY * U.G))
+        tk = ("first_permeable_temperature" if key == "first_permeable"
+              else "seafloor_temperature")
+        t = od.get(tk) if od.get(tk) is not None else od.get("seafloor_temperature")
+        z.temperature = (U.temperature(float(t), un.temperature) if t is not None
+                         else U.temperature(70.0, "F"))
+        z.salinity = fluids.salinity_to_mass_fraction(
+            float(od.get("salinity_ppm") or SEAWATER_SALINITY_PPM), "ppm")
+        return z
+
+    first = "mud_line" if ref == "most_protective" else ref
+    p.usdw = reference_zone(first)
+    p.offshore = {"water_depth": wd, "reference": first, "choice": ref,
+                  "label": OFFSHORE_REFERENCES[first]}
+    if ref == "most_protective":
+        # the run computes both thresholds and keeps the lower one
+        p.offshore["alternatives"] = {k: reference_zone(k) for k in OFFSHORE_REFERENCES}
+    if "ground" in (p.datum or "").lower():
+        p.warnings.append("offshore project: measure every depth from sea level "
+                          "(the mud line is at the water depth), not from ground level")
+
+
+# ==========================================================================
+def _zone_from_dict(z: dict, un: Units, name: str) -> Zone:
+    """Read one interval. Shared by the single and stacked spellings."""
+    out = Zone(name=name)
+    z = z or {}
+    if "top_depth" in z:
+        out.top_depth = U.length(float(z["top_depth"]), un.depth)
+    if "base_depth" in z:
+        out.base_depth = U.length(float(z["base_depth"]), un.depth)
+    if "thickness" in z:
+        out.thickness = U.length(float(z["thickness"]), un.length)
+    elif np.isfinite(out.top_depth) and np.isfinite(out.base_depth):
+        out.thickness = out.base_depth - out.top_depth
+    for src, dst, conv in (
+        ("porosity", "porosity", float),
+        ("permeability", "permeability",
+         lambda v: U.permeability(float(v), un.permeability)),
+        ("temperature", "temperature", lambda v: U.temperature(float(v), un.temperature)),
+        ("initial_pressure", "initial_pressure",
+         lambda v: U.pressure(float(v), un.pressure)),
+        ("rock_compressibility", "rock_compressibility",
+         lambda v: U.compressibility(float(v), un.compressibility)),
+        ("dip_degrees", "dip_degrees", float),
+        ("dip_azimuth", "dip_azimuth", float),
+        ("anisotropy_kv_kh", "anisotropy_kv_kh", float),
+    ):
+        if src in z and z[src] is not None:
+            setattr(out, dst, conv(z[src]))
+    if "salinity_ppm" in z:
+        out.salinity = fluids.salinity_to_mass_fraction(float(z["salinity_ppm"]), "ppm")
+    elif "salinity" in z:
+        out.salinity = fluids.salinity_to_mass_fraction(
+            float(z["salinity"]), z.get("salinity_unit", "ppm"))
+    out.stage_of = str(z.get("stage_of") or "")
+    out.lithology = str(z.get("lithology") or "")
+    return out
+
+
+def _relperm_from_dict(rp: dict) -> RelPerm:
+    """Brooks-Corey or van Genuchten from a relative_permeability section."""
+    if str(rp.get("model", "brooks_corey")).lower().startswith("van"):
+        return VanGenuchten(
+            swr=float(rp.get("swr", 0.30)), sgr=float(rp.get("sgr", 0.05)),
+            lam=float(rp.get("lambda", 0.457)), krg0=float(rp.get("krg0", 1.0)))
+    return BrooksCorey(
+        swr=float(rp.get("swr", 0.30)), sgr=float(rp.get("sgr", 0.20)),
+        krw0=float(rp.get("krw0", 1.0)), krg0=float(rp.get("krg0", 0.30)),
+        m=float(rp.get("m", 3.0)), n=float(rp.get("n", 3.0)))
+
+
+def _blank(v) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip()) or         (isinstance(v, float) and not np.isfinite(v))
+
+
+def _expand_staged_intervals(d: dict) -> list[str]:
+    """Turn staged completions into injection intervals of their own.
+
+    Many Gulf Coast plans perforate a thin interval, inject, then plug back and
+    move up: each stage puts the whole rate into tens of feet of sand rather
+    than the full zone. A well that gives ``open_thickness`` (and optionally
+    ``open_top_depth``, or an ``interval`` name shared by the wells in the
+    same stage) is moved into an interval of that thickness, cut from the zone
+    it is completed in and inheriting that zone's rock, fluids and confining
+    zone. Wells in the same interval share it, so their pressures add. Each
+    interval is then run as a stacked zone and the AoR is the union.
+
+    Treating an interval as its own layer assumes the shales between stages
+    isolate it, which is what makes staged pressure fronts large; it is the
+    conservative reading where the plan does not show vertical communication.
+    Edits ``d`` in place and returns notes for the warnings list.
+    """
+    wells = d.get("wells") or []
+    staged = [w for w in wells if not _blank(w.get("open_thickness"))]
+    if not staged:
+        return []
+    fm = d.setdefault("formation", {})
+    if fm.get("injection_zones"):
+        parents = [dict(z) for z in fm["injection_zones"]]
+    else:
+        one = dict(fm.get("injection_zone") or {})
+        one.setdefault("name", "injection zone")
+        if fm.get("confining_zone"):
+            one.setdefault("confining_zone", dict(fm["confining_zone"]))
+        parents = [one]
+    for k, z in enumerate(parents):
+        z.setdefault("name", f"zone {k + 1}")
+    by_name = {str(z["name"]).strip().lower(): z for z in parents}
+
+    def parent_of(w):
+        t = str(w.get("zone") or "").strip().lower()
+        if t:
+            return by_name.get(t)
+        return parents[0] if len(parents) == 1 else None
+
+    length_unit = (d.get("units") or {}).get("depth", "ft")
+    groups: dict = {}
+    notes: list[str] = []
+    for w in staged:
+        par = parent_of(w)
+        if par is None:
+            raise ValueError(
+                f"well {w.get('name')!r} gives open_thickness but not which injection "
+                "zone it is completed in; add its zone name")
+        h = float(w["open_thickness"])
+        top = None if _blank(w.get("open_top_depth")) else float(w["open_top_depth"])
+        label = str(w.get("interval") or "").strip()
+        key = (str(par["name"]), label or (top, h))
+        if key not in groups:
+            z = {k: v for k, v in par.items() if k not in ("base_depth", "name")}
+            z["thickness"] = h
+            if top is not None and not _blank(par.get("top_depth")):
+                ptop = float(par["top_depth"])
+                if not _blank(par.get("initial_pressure")) and ptop > 0:
+                    # carry the zone's own pressure gradient down to the interval
+                    z["initial_pressure"] = float(par["initial_pressure"]) * top / ptop
+                z["top_depth"] = top
+            where = label or (f"open {h:g} {length_unit}"
+                              + (f" from {top:g} {length_unit}" if top is not None else ""))
+            z["name"] = f"{par['name']} / {where}"
+            z["stage_of"] = str(par["name"])
+            groups[key] = z
+            ptk = None if _blank(par.get("thickness")) else float(par["thickness"])
+            if ptk is not None and h > ptk:
+                notes.append(f"well {w.get('name')!r}: open_thickness {h:g} is more than the "
+                             f"net thickness of {par['name']!r} ({ptk:g})")
+        w["zone"] = groups[key]["name"]
+
+    # a zone keeps its own run only if some unstaged well still injects or
+    # produces there
+    kept = []
+    for z in parents:
+        nm = str(z["name"]).strip().lower()
+        users = [w for w in wells if _blank(w.get("open_thickness"))
+                 and (str(w.get("zone") or "").strip().lower() == nm
+                      or (_blank(w.get("zone")) and len(parents) == 1))]
+        if users:
+            if len(parents) == 1:
+                for w in users:
+                    w["zone"] = z["name"]
+            kept.append(z)
+    intervals = sorted(groups.values(), key=lambda z: float(z.get("top_depth") or 0.0))
+    fm["injection_zones"] = sorted(kept + intervals,
+                                   key=lambda z: float(z.get("top_depth") or 0.0))
+    fm.pop("injection_zone", None)
+    for z in intervals:
+        notes.append(
+            f"staged completion: {z['name']!r} is modelled as its own "
+            f"{z['thickness']:g} {length_unit} layer of {z['stage_of']!r}, isolated "
+            "from the rest of the zone by the shales between stages. This is the "
+            "conservative reading; if the plan shows vertical communication between "
+            "stages, give the full zone instead.")
+    return notes
+
+
+def _parse_date(value):
+    """An ISO date (or datetime, or date) as a `datetime.date`, else None."""
+    import datetime as _dt
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    try:
+        return _dt.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _years_since(value, origin) -> float | None:
+    """Decimal years from `origin` to `value`, or None if either is missing."""
+    d, o = _parse_date(value), _parse_date(origin)
+    if d is None or o is None:
+        return None
+    return (d - o).days / 365.25
+
+
+def _project_origin(d: dict) -> str:
+    """The date model time is measured from.
+
+    The project may name one. If it does not but the wells carry dates, the
+    earliest of those is the start of injection, which is the datum a permit
+    counts from anyway.
+    """
+    named = _parse_date((d.get("project") or {}).get("start_date"))
+    if named:
+        return named.isoformat()
+    dates = [_parse_date(w.get("start_date")) for w in (d.get("wells") or [])]
+    dates = [x for x in dates if x is not None]
+    return min(dates).isoformat() if dates else ""
+
+
+def _well_from_dict(w: dict, un: Units, origin: str = "") -> WellSpec:
+    kind = str(w.get("kind", "injector")).lower()
+    x = U.length(float(w.get("x", 0.0)), w.get("coordinate_unit", un.length))
+    y = U.length(float(w.get("y", 0.0)), w.get("coordinate_unit", un.length))
+
+    sched: list[tuple[float, float]] = []
+    if w.get("schedule"):
+        for step in w["schedule"]:
+            t = U.time(float(step["year"]), un.time)
+            if kind == "injector":
+                q = U.mass_rate(float(step["rate"]), step.get("unit", un.rate))
+            else:
+                q = U.volume_rate(float(step["rate"]), step.get("unit", un.brine_rate))
+            sched.append((t, q))
+    elif w.get("start_date") is not None:
+        # Calendar dates are how an operator writes a schedule. They are
+        # converted against the project start, which `_resolve_dates` fills in
+        # from the earliest well date when the project does not name one.
+        start = _years_since(w["start_date"], origin) or 0.0
+        stop = _years_since(w.get("stop_date"), origin)
+        rate = float(w.get("rate", 0.0))
+        q = (U.mass_rate(rate, w.get("rate_unit", un.rate)) if kind == "injector"
+             else U.volume_rate(rate, w.get("rate_unit", un.brine_rate)))
+        sched = [(U.time(start, "yr"), q)]
+        if stop is not None:
+            sched.append((U.time(stop, "yr"), 0.0))
+    else:
+        start = U.time(float(w.get("start_year", 0.0)), un.time)
+        stop = U.time(float(w.get("stop_year", 0.0)), un.time)
+        rate = float(w.get("rate", 0.0))
+        q = (U.mass_rate(rate, w.get("rate_unit", un.rate)) if kind == "injector"
+             else U.volume_rate(rate, w.get("rate_unit", un.brine_rate)))
+        sched = [(start, q), (stop, 0.0)]
+
+    return WellSpec(
+        name=str(w.get("name", "well")), x=x, y=y, kind=kind, schedule=sched,
+        latitude=float(w["latitude"]) if w.get("latitude") is not None else float("nan"),
+        longitude=float(w["longitude"]) if w.get("longitude") is not None else float("nan"),
+        radius=U.length(float(w.get("radius", 0.33)), w.get("radius_unit", "ft")),
+        max_bhp=(U.pressure(float(w["max_bhp"]), un.pressure)
+                 if w.get("max_bhp") is not None else float("inf")),
+        # which stacked injection zone this completion feeds; blank means the
+        # well is open to all of them and its rate gets split by k*h
+        zone=str(w.get("zone") or "").strip(),
+    )
+
+
+def _default_output_times(end_time: float, wells: list[WellSpec]) -> np.ndarray:
+    """Output times that resolve the injection period and the long tail.
+
+    Dense early (the plume moves fastest then), a point on every rate change,
+    and logarithmically spaced afterwards so a 500-year run does not need 500
+    snapshots.
+    """
+    end_yr = U.time_out(end_time, "yr")
+    inj_end = max((U.time_out(w.stop_time(), "yr") for w in wells), default=end_yr)
+    early = list(np.unique(np.round(np.concatenate([
+        [0.0], np.linspace(0.25, min(inj_end, end_yr), 12)]), 3)))
+    late = []
+    if end_yr > inj_end:
+        late = list(inj_end + np.unique(np.round(np.geomspace(
+            0.5, max(end_yr - inj_end, 1.0), 14), 3)))
+    changes = [U.time_out(t, "yr") for w in wells for t, _ in w.schedule]
+    all_t = sorted({round(t, 4) for t in early + late + changes + [end_yr]
+                    if 0.0 <= t <= end_yr})
+    return U.time(np.array(all_t, float), "yr")
+
+
+def zone_output_times(p: Project, wells: list[WellSpec], marks) -> np.ndarray:
+    """Output times for one zone of a stacked run.
+
+    Built from the zone's own wells, so a zone injected for six years of a
+    thirteen-year staged project is sampled as densely as it would be run on
+    its own; the re-evaluation dates are added. A file that sets
+    model.output_years keeps those for every zone.
+    """
+    base = (np.asarray(p.output_times, float) if p.output_times_given
+            else _default_output_times(p.end_time, wells))
+    return np.unique(np.concatenate([base, np.asarray(marks, float)]))
+
+
+__all__ = ["Project", "Zone", "WellSpec", "Units", "zone_output_times"]

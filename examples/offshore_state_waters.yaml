@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------------
+# Offshore storage in Texas state waters - the offshore critical pressure
+#
+# Shows the offshore mode. In the Texas Offshore (Gulf of Mexico/America) a
+# USDW may not be present, so the critical pressure is measured
+# against the seafloor ("mud line"), or the base of the first
+# permeable stratum below it, instead of the base of the lowermost USDW. The
+# Commission protects surface water as well as USDWs [16 TAC 4.101;
+# 16 TAC 5.206(b)(2)], so the pressure front here marks where a conduit could
+# carry formation fluid or CO2 to the seafloor.
+#
+# Every depth is measured from sea level. The mud-line pressure is one
+# atmosphere plus the seawater column (0.444 psi/ft); the toolkit fills that in.
+#
+# Everything here is invented: an under-pressured Miocene-style sand under a thick
+# shale, about six miles off Padre Island. It is not any real project's data or
+# lease, and it is not a benchmark.
+# ---------------------------------------------------------------------------
+
+project:
+  name: Offshore State Waters (synthetic)
+  operator: worked example
+  permit: n/a
+  datum: sea level, depths positive downward
+  notes: >
+    Two injectors in Texas state waters, 60 ft of water. The critical pressure
+    is computed against both the mud line and the base of the first permeable
+    stratum below it, and the lower one (the more protective AoR) is used: the
+    deepest depth needed to prevent discharge to the seafloor.
+
+offshore:
+  water_depth: 60              # sea level to the mud line, ft
+  first_permeable_base: 450    # base of the first permeable stratum below it, ft
+  reference: most_protective   # compare both, keep the lower critical pressure;
+                               # or mud_line, or first_permeable
+  seafloor_temperature: 68     # degF
+
+units:
+  length: ft
+  depth: ft
+  pressure: psi
+  temperature: F
+  permeability: mD
+  rate: MMT/yr
+  time: yr
+  compressibility: 1/psi
+
+formation:
+  injection_zone:
+    top_depth: 6500            # ft below sea level
+    thickness: 280
+    porosity: 0.26
+    permeability: 400
+    temperature: 165
+    salinity_ppm: 60000
+    initial_pressure: 2750     # under-pressured (about 0.415 psi/ft)
+    rock_compressibility: 6.0e-6
+    dip_degrees: 0.6
+    dip_azimuth: 120
+  confining_zone:
+    top_depth: 6050
+    base_depth: 6500           # 450 ft of shale
+
+relative_permeability:
+  model: brooks_corey
+  swr: 0.30
+  sgr: 0.25
+  krg0: 0.35
+  m: 3.0
+  n: 3.0
+
+threshold:
+  method: auto                 # every method, against the mud line; most protective wins
+
+wells:
+  - name: OFF-1
+    latitude: 27.200
+    longitude: -97.150
+    rate: 1.0
+    start_year: 0
+    stop_year: 20
+
+  - name: OFF-2
+    latitude: 27.212
+    longitude: -97.138
+    rate: 1.0
+    start_year: 1
+    stop_year: 20
+
+model:
+  engine: ve
+  grid:
+    cell_size: 400
+    fine_half_width: 18000
+    half_width: 95000
+    growth: 1.12
+  boundary: constant_pressure
+  end_year: 100                # 20 yr injection + 80 yr post-injection
+
+plume:
+  cutoff: 0.02
+  criterion: column-averaged CO2 saturation >= 0.02
+
+uncertainty:
+  enabled: false
