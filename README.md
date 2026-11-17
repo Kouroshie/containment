@@ -1,5 +1,9 @@
 # Containment
 
+[![Open the app](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://containment.streamlit.app)
+
+**Use it in your browser, nothing to install: https://containment.streamlit.app**
+
 Open-source Python toolkit for the three technical demonstrations behind a UIC
 **Class VI** permit: delineating the **Area of Review (AoR)**, sizing the
 **corrective-action** list for artificial penetrations, and testing a
