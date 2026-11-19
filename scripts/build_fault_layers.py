@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import os
+import ssl
 import sys
 import urllib.parse
 import urllib.request
@@ -46,8 +47,27 @@ TEXNET = ("https://catalog.texnet.beg.utexas.edu/api/earthquake/DownloadCsv?"
           "minMagnitude=2&start=2017-01-01&end={end}")
 
 
+def _ssl_context():
+    """Verify certificates against certifi's bundle when it is installed.
+
+    The Windows certificate store can lag behind a server's new issuer (TexNet's
+    catalog moved to an InCommon / emSign chain in Nov 2026 and failed with
+    CERTIFICATE_VERIFY_FAILED); certifi carries current roots. Verification
+    stays on either way.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+_SSL = _ssl_context()
+
+
 def _get(url, timeout=180):
-    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout).read()
+    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout,
+                                  context=_SSL).read()
 
 
 def _rest_geojson(base, extra):
@@ -87,12 +107,8 @@ def _shp_features(reader, to_wgs, props_of):
     return out
 
 
-def main(raw):
-    os.makedirs(OUT, exist_ok=True)
-    os.makedirs(raw, exist_ok=True)
-    manifest = []
-
-    # 1 Geologic Database of Texas, faults
+def _layer_tx_faults_250k(raw):
+    """Geologic Database of Texas, faults."""
     feats = []
     for f in _rest_geojson(F250, {"orderByFields": "OBJECTID"}):
         code = int(f["properties"].get("fault_cd") or 0)
@@ -101,7 +117,7 @@ def main(raw):
                           "properties": {"type": F250_TYPES[code],
                                          "sheet": f["properties"].get("beg_origin_cd")}})
     size = _write("tx_faults_250k", feats)
-    manifest.append({
+    return {
         "id": "tx_faults_250k", "title": "Texas surface faults (Geologic Database of Texas, 1:250,000)",
         "kind": "surface", "count": len(feats), "bytes": size, "colour": "#d62728", "weight": 1.6,
         "dash": None, "show": True,
@@ -110,9 +126,11 @@ def main(raw):
         "url": F250, "licence": "CC0",
         "note": "Faults mapped at the ground surface at 1:250,000 (locations good to about 100 to "
                 "250 m). A surface trace says where a fault reaches the surface, not where it is "
-                "at injection depth."})
+                "at injection depth."}
 
-    # 2 USGS Gulf Coast faults and fault zones
+
+def _layer_gulf_coast_faults(raw):
+    """USGS Gulf Coast faults and fault zones."""
     gc = []
     for name, item in SCIENCEBASE.items():
         d = json.loads(_get(f"https://www.sciencebase.gov/catalog/item/{item}?format=json&fields=facets"))
@@ -130,7 +148,7 @@ def main(raw):
                                                      (TEXAS[2], TEXAS[3]), (TEXAS[0], TEXAS[3]),
                                                      (TEXAS[0], TEXAS[1])]]}))]
     size = _write("gulf_coast_faults", gc)
-    manifest.append({
+    return {
         "id": "gulf_coast_faults", "title": "Gulf Coast regional faults and fault zones (USGS, after Ewing and Lopez 1991)",
         "kind": "subsurface", "count": len(gc), "bytes": size, "colour": "#9467bd", "weight": 2.0,
         "dash": "8 4", "show": True,
@@ -141,12 +159,18 @@ def main(raw):
         "licence": "public domain (USGS; no use constraints)",
         "note": "Regional, schematic trends of growth faults and fault zones at depth (Balcones, "
                 "Luling, Mexia, Talco, Frio, Vicksburg, Yegua, Miocene). A trend line, not a "
-                "located fault plane at a given depth."})
+                "located fault plane at a given depth."}
 
-    # 3 BEG Permian basement-rooted faults
+
+def _layer_permian_basement_faults(raw):
+    """BEG Permian basement-rooted faults."""
     perm = []
     for label, fid in PERMIAN.items():
-        z = zipfile.ZipFile(io.BytesIO(_get(DATAVERSE + str(fid))))
+        data = _get(DATAVERSE + str(fid))
+        if not zipfile.is_zipfile(io.BytesIO(data)):
+            raise RuntimeError(f"Texas Data Repository file {fid} came back as a web page, not a "
+                               "zip (the site is blocking scripted downloads or the file moved)")
+        z = zipfile.ZipFile(io.BytesIO(data))
         shp = [n for n in z.namelist() if n.lower().endswith(".shp")][0]
         folder = os.path.join(raw, str(fid))
         z.extractall(folder)
@@ -167,7 +191,7 @@ def main(raw):
             return keep
         perm += _shp_features(r, fwd, props)
     size = _write("permian_basement_faults", perm)
-    manifest.append({
+    return {
         "id": "permian_basement_faults", "title": "Permian Basin basement-rooted faults (BEG, Horne et al.)",
         "kind": "subsurface", "count": len(perm), "bytes": size, "colour": "#ff7f0e", "weight": 2.0,
         "dash": None, "show": True,
@@ -178,9 +202,11 @@ def main(raw):
         "url": "https://doi.org/10.18738/T8/UHOUX8", "licence": "CC0",
         "note": "Faults interpreted from 3-D and 2-D seismic and well data at basement and "
                 "Ellenburger level, with confidence and dip where given. The most relevant public "
-                "map for deep Permian injection; still an interpretation at regional scale."})
+                "map for deep Permian injection; still an interpretation at regional scale."}
 
-    # 4 USGS Quaternary faults (Texas)
+
+def _layer_quaternary_faults(raw):
+    """USGS Quaternary faults (Texas)."""
     q = _rest_geojson(QFAULTS, {"geometry": ",".join(map(str, TEXAS)),
                                 "geometryType": "esriGeometryEnvelope", "inSR": 4326,
                                 "spatialRel": "esriSpatialRelIntersects"})
@@ -190,7 +216,7 @@ def main(raw):
                           if f["properties"].get(k)}}
           for f in q if f.get("geometry")]
     size = _write("quaternary_faults", qf)
-    manifest.append({
+    return {
         "id": "quaternary_faults", "title": "Quaternary (young) faults (USGS Quaternary Fault and Fold Database)",
         "kind": "surface", "count": len(qf), "bytes": size, "colour": "#8c564b", "weight": 2.2,
         "dash": None, "show": False,
@@ -198,9 +224,11 @@ def main(raw):
                   "and fold database of the United States",
         "url": QFAULTS, "licence": "public domain (USGS)",
         "note": "Faults with evidence of movement in the last 1.6 million years. In Texas these "
-                "are in the Trans-Pecos only."})
+                "are in the Trans-Pecos only."}
 
-    # 5 TexNet earthquakes (context)
+
+def _layer_texnet_earthquakes(raw):
+    """TexNet earthquakes (context)."""
     import datetime as _dt
     rows = list(csv.DictReader(io.StringIO(_get(TEXNET.format(end=_dt.date.today().isoformat()))
                                            .decode("utf-8", "replace"))))
@@ -216,7 +244,7 @@ def main(raw):
                    "properties": {"id": r.get("EventID"), "date": r.get("Origin Date"), "mag": mag,
                                   "depth_km": r.get("Depth of Hypocenter (Km. Rel to Ground Surface)")}})
     size = _write("texnet_earthquakes", eq)
-    manifest.append({
+    return {
         "id": "texnet_earthquakes", "title": "TexNet earthquakes, magnitude 2 and above, 2017 on",
         "kind": "seismicity", "count": len(eq), "bytes": size, "colour": "#17becf", "weight": 1,
         "dash": None, "show": False,
@@ -224,12 +252,40 @@ def main(raw):
         "source": "TexNet Seismic Monitoring Program, Bureau of Economic Geology, earthquake catalog",
         "url": "https://catalog.texnet.beg.utexas.edu", "licence": "public catalog; cite TexNet",
         "note": "A snapshot taken when this build was made. Earthquakes can mark active faults "
-                "that no map shows."})
+                "that no map shows."}
+
+
+LAYERS = (_layer_tx_faults_250k, _layer_gulf_coast_faults, _layer_permian_basement_faults,
+          _layer_quaternary_faults, _layer_texnet_earthquakes)
+
+
+def main(raw):
+    """Rebuild every layer; a source that fails keeps its previous file and manifest entry."""
+    os.makedirs(OUT, exist_ok=True)
+    os.makedirs(raw, exist_ok=True)
+    try:
+        with open(os.path.join(OUT, "layers.json"), encoding="utf-8") as fh:
+            old = {m["id"]: m for m in json.load(fh)}
+    except (OSError, ValueError):
+        old = {}
+    manifest, failed = [], []
+    for build in LAYERS:
+        lid = build.__name__[len("_layer_"):]
+        try:
+            manifest.append(build(raw))
+        except Exception as e:  # noqa: BLE001  any download or parse failure
+            if lid not in old or not os.path.exists(os.path.join(OUT, lid + ".geojson")):
+                raise
+            failed.append(lid)
+            manifest.append(old[lid])
+            print(f"WARNING {lid}: {type(e).__name__}: {e}. Kept the previous copy "
+                  f"(snapshot {old[lid].get('snapshot', 'earlier build')}).")
 
     with open(os.path.join(OUT, "layers.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=1)
     for m in manifest:
-        print(f"{m['id']:26s} {m['count']:6d} features {m['bytes'] / 1e6:6.2f} MB")
+        print(f"{m['id']:26s} {m['count']:6d} features {m['bytes'] / 1e6:6.2f} MB"
+              + ("  (kept previous copy)" if m['id'] in failed else ""))
 
 
 if __name__ == "__main__":
