@@ -136,7 +136,7 @@ DEFAULTS = {
     "ref_end": True, "end_year": 100.0, "cutoff": 0.01,
     "stacked": False, "unc": False, "n_real": 150,
     "source": "Form", "map_view": "Plan view", "pens_unit": "ft",
-    "fault_reach": 1.0, "fault_mult": 0.0,
+    "fault_reach": 1.0, "fault_mult": 0.0, "texnet_on": True, "texnet_reach": 5.0,
 }
 # widgets whose default is known only when drawn; kept once they exist
 _KEEP = ("example_pick", "fault_layers", "basemap")
@@ -596,6 +596,73 @@ def _fault_rerun(reach_mi: float, ctx, basemap: str, project, res) -> None:
                "injection depth: this bounds the effect, it does not predict it.")
 
 
+def _texnet_near(project, res, reach_mi: float):
+    """Live TexNet data near the final AoR, or None when the project is not georeferenced."""
+    try:
+        from containment import gis
+        from containment import texnet as _TX
+
+        a = gis.aor_lonlat(res.aor, gis.MapContext.from_project(project))
+        if a is None:
+            return None
+        with st.spinner("fetching TexNet data near the AoR"):
+            return _TX.near(a, float(reach_mi))
+    except Exception as exc:                  # screening context must not break the page
+        st.info(f"TexNet data could not be fetched: {exc}")
+        return None
+
+
+def _texnet_panel(tx) -> None:
+    """Tables of the live TexNet data drawn on the GIS map."""
+    s = tx.summary()
+    with st.container(border=True):
+        st.markdown("##### TexNet near the AoR")
+        eq, wl, ar = tx.earthquakes, tx.wells, tx.areas
+        inside = [r for r in ar.rows if r["relation"] != "outside"]
+        touching = [r for r in inside if r["relation"] in ("AoR inside", "overlaps the AoR")]
+        if touching:
+            st.warning(
+                f"The AoR lies in or overlaps {len(touching)} TexNet seismic investigation "
+                "or response area(s). Check that the application describes the seismic "
+                "history and shows the seismicity would not interfere with containment "
+                "(40 CFR 146.82(a)(3)(v)).")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Earthquakes M2+ since 2017", f"{s['earthquakes']:,}",
+                  help=f"Within {tx.distance_mi:g} mi of the AoR."
+                       + (f" Largest M{s['largest_magnitude']:.1f}."
+                          if s["largest_magnitude"] is not None else ""))
+        c2.metric("Injection wells reporting to TexNet", f"{s['injection_wells']:,}",
+                  help=f"{s['injection_wells_in_aor']} inside the AoR.")
+        c3.metric("Seismic areas in reach", f"{len(inside):,}",
+                  help=f"{len(touching)} contain or overlap the AoR.")
+        status = {"live": "live", "snapshot": "bundled snapshot (TexNet unreachable)",
+                  "unavailable": "not available"}
+        st.caption(
+            f"Earthquakes: {status[eq.status]}" + (f", fetched {eq.fetched}" if eq.fetched else "")
+            + f". Wells: {status[wl.status]}. Areas: {status[ar.status]}. Source: TexNet "
+            "Seismic Monitoring Program, Bureau of Economic Geology. Context for a reviewer, "
+            "not a model input.")
+        for part in (eq, wl, ar):
+            if part.error and part.status != "live":
+                st.caption(f"{part.source}: {part.error}")
+        tabs = st.tabs([f"Earthquakes ({len(eq.rows)})", f"Injection wells ({len(wl.rows)})",
+                        f"Seismic areas ({len(ar.rows)})"])
+        for tab, part, name in zip(tabs, (eq, wl, ar),
+                                   ("earthquakes", "injection_wells", "seismic_areas"),
+                                   strict=True):
+            with tab:
+                if not part.rows:
+                    st.caption(f"None within {tx.distance_mi:g} mi of the AoR."
+                               if part.status != "unavailable" else "Not available.")
+                    continue
+                st.dataframe(part.rows, hide_index=True)
+                import pandas as pd
+                st.download_button(
+                    "Download (CSV)", pd.DataFrame(part.rows).to_csv(index=False),
+                    f"texnet_{name}.csv", "text/csv", key=f"texnet_dl_{name}",
+                    icon=":material/download:")
+
+
 def _faults_near(project, res, reach_mi: float):
     """Mapped faults near the final AoR, or None when the project is not
     georeferenced or no layers ship with this copy."""
@@ -677,6 +744,9 @@ def page_start(project, proj_err, res) -> None:
                         SS["_upload_dict"] = _read_project_file(up)
                         SS["_upload_name"] = up.name
                         SS["_upload_id"] = fid
+                        # the project was read near the top of this run, before the
+                        # file arrived: rerun so the sidebar and Run see it now
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Could not read {up.name}: {exc}")
             if SS.get("_upload_dict"):
@@ -1257,6 +1327,17 @@ def _map_gis(project, res) -> None:
                      "layers show where faults reach the ground; subsurface layers are "
                      "regional or basement interpretations. Neither is the application's own "
                      "fault interpretation at injection depth. Sources are listed below.")
+        t1, t2 = st.columns([1, 2], vertical_alignment="bottom")
+        tx_on = t1.toggle(
+            "Live TexNet data", key="texnet_on",
+            help="Fetch earthquakes, injection wells that report to TexNet, and seismic "
+                 "investigation and response areas near the AoR from TexNet (Bureau of "
+                 "Economic Geology). Needs internet; remembered for an hour.")
+        tx_reach = t2.number_input(
+            "TexNet search distance from the AoR (mi)", min_value=0.0, max_value=25.0,
+            step=1.0, key="texnet_reach",
+            disabled=not tx_on)
+        tx = _texnet_near(project, res, tx_reach) if tx_on else None
         gview, _gdp, gcap = _time_view("gis", project, res)
         if gcap:
             st.caption(gcap)
@@ -1268,7 +1349,7 @@ def _map_gis(project, res) -> None:
                             penetrations=res.corrective, basemap=base,
                             title=f"{project.name} - Area of Review"
                                   + (f", year {yr:,.1f}" if yr is not None else ""),
-                            fault_layers=shown)
+                            fault_layers=shown, texnet=tx)
         _embed_html(html, height=620)
         st.caption(f"Georeferencing: {ctx.note}")
         d1, d2 = st.columns([1, 2])
@@ -1299,7 +1380,8 @@ def _map_gis(project, res) -> None:
                     st.dataframe(near, hide_index=True)
                 else:
                     st.success(f"No mapped fault crosses the AoR or lies within {reach:g} mi.")
-                eq = _FL.earthquakes_near(a_ll, max(reach, 5.0))
+                live_eq = tx is not None and tx.earthquakes.status == "live"
+                eq = None if live_eq else _FL.earthquakes_near(a_ll, max(reach, 5.0))
                 if eq:
                     st.caption(
                         f"TexNet: {eq['count']} earthquake(s) of magnitude 2 or more since "
@@ -1311,6 +1393,9 @@ def _map_gis(project, res) -> None:
                     "or regional trends, not fault planes at injection depth. The model uses "
                     "the faults entered in the project (Faults sheet, or faults: in YAML).")
                 _fault_rerun(reach, ctx, base, project, res)
+        if tx is not None:
+            _texnet_panel(tx)
+        if man:
             with st.expander("Sources of the fault and earthquake layers"):
                 st.dataframe([{"layer": m["title"], "kind": m["kind"], "features": m["count"],
                                "source": m["source"], "licence": m["licence"],

@@ -387,6 +387,21 @@ injection depth. The model uses the faults entered in the project.
 `fault_layers.as_model_faults` turns nearby mapped faults into project
 `faults:` entries for a sensitivity test.
 
+### Live TexNet data near the AoR
+
+With internet access, the GIS page also fetches from TexNet (the Texas
+Seismological Network, Bureau of Economic Geology; no login) for a chosen
+distance around the AoR: earthquakes of magnitude 2 and above since 2017
+(the catalog's own `api/earthquake/events` call), injection wells that report
+daily volumes or pressures to TexNet, and the seismic investigation regions
+(2 to 25 km rings) and seismic response areas. The rings are published as
+lines, so they are closed into areas before testing; an AoR that sits wholly
+inside a ring is reported as such. Each part is drawn on the map, listed in a
+table with a CSV download, and fetched on its own: a part TexNet cannot serve
+says so, and the earthquakes fall back to the bundled snapshot. Answers are
+remembered for an hour. Like the fault maps, this is context for a reviewer,
+not a model input. In code: `containment.texnet.near(aor_lonlat, distance_mi)`.
+
 ### The AoR at each re-evaluation
 
 40 CFR 146.84(e) requires the AoR to be re-evaluated at least every five

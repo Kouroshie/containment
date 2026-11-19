@@ -271,3 +271,24 @@ def test_an_example_with_uncertainty_ticks_the_run_option():
     # an example without it leaves the option off
     at.selectbox(key="example_pick").set_value("stacked_zones.yaml").run()
     assert at.session_state["unc"] is False
+
+
+@pytest.mark.slow
+def test_gis_page_shows_live_texnet_data_near_the_aor(monkeypatch):
+    import test_texnet
+
+    from containment import texnet as TX
+    TX.clear_cache()
+    monkeypatch.setattr(TX, "get_json", test_texnet.fake)
+    monkeypatch.setattr(TX, "cached_get_json", test_texnet.fake)
+    at = _go(_run(_at(900)), "maps")
+    at.radio(key="map_view").set_value("GIS map and faults").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert "TexNet near the AoR" in " ".join(m.value for m in at.markdown)
+    labels = [m.label for m in at.metric]
+    assert "Injection wells reporting to TexNet" in labels
+    assert any("Earthquakes: live" in c.value for c in at.caption)
+    at.toggle(key="texnet_on").set_value(False).run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert "TexNet near the AoR" not in " ".join(m.value for m in at.markdown)
+    TX.clear_cache()

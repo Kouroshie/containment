@@ -175,7 +175,7 @@ FAULT_LEGEND_NAMES = {
 
 
 def _legend_html(result, plan, ctx: MapContext, title: str,
-                 fault_rows: list | None = None) -> str:
+                 fault_rows: list | None = None, texnet_rows: list | None = None) -> str:
     coincident = result.coincident_with()
     rows = [
         ("#0b0b0b", "dashed" if coincident else "solid",
@@ -214,6 +214,11 @@ def _legend_html(result, plan, ctx: MapContext, title: str,
         items += ("<div style='margin:3px 0 0;color:#8a8983;font-size:11px'>Public maps, "
                   "not the application's faults at injection depth; count = features "
                   "drawn in this map area.</div>")
+    if texnet_rows:
+        items += "<div style='margin-top:7px;font-weight:600'>TexNet near the AoR</div>"
+        for sym, label in texnet_rows:
+            items += (f"<div style='margin:2px 0'>{sym}<span style='margin-left:8px'>"
+                      f"{label}</span></div>")
     if plan is not None:
         counts = {}
         for w in plan.inside:
@@ -287,10 +292,77 @@ def _add_fault_layers(m, layer_ids, bounds_lonlat):
     return drawn
 
 
+TEXNET_STYLE = {"earthquake": "#c2185b", "well": "#6a3d9a", "area": "#e6a100"}
+
+
+def _add_texnet(m, near) -> list:
+    """Draw a :class:`containment.texnet.TexNetNear` (live TexNet data near the AoR).
+
+    Returns ``[(legend symbol html, label)]`` for the parts drawn."""
+    rows = []
+    eq, wl, ar = near.earthquakes, near.wells, near.areas
+    if ar.features:
+        c = TEXNET_STYLE["area"]
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": ar.features},
+            name=f"TexNet seismic areas ({len(ar.features)})", show=True,
+            style_function=lambda _f: {"color": c, "weight": 2, "dashArray": "6 4",
+                                       "fillColor": c, "fillOpacity": 0.06},
+            tooltip=folium.GeoJsonTooltip(fields=["area", "name", "relation"],
+                                          aliases=["area", "name", "relation"])).add_to(m)
+        rows.append((f"<span style='display:inline-block;width:22px;border-top:2px dashed {c};"
+                     f"vertical-align:middle'></span>",
+                     f"Seismic investigation / response areas ({len(ar.features)})"))
+    if wl.features:
+        c = TEXNET_STYLE["well"]
+        g = folium.FeatureGroup(name=f"TexNet injection wells ({len(wl.features)})", show=True)
+        for f in wl.features:
+            lon, lat = f["geometry"]["coordinates"][:2]
+            p = f["properties"]
+            interval = (f"{p['top (ft)']:,}-{p['bottom (ft)']:,} ft"
+                        if p["top (ft)"] is not None and p["bottom (ft)"] is not None else "n/a")
+            folium.RegularPolygonMarker(
+                [lat, lon], number_of_sides=3, radius=6, rotation=30, color=c, weight=1.5,
+                fill=True, fill_color=c, fill_opacity=0.75,
+                tooltip=f"UIC {p['UIC number']}: {p['lease']} {p['well']}".strip(),
+                popup=folium.Popup(
+                    f"<b>UIC {p['UIC number']}</b> (API {p['API']})<br>{p['lease']} {p['well']}"
+                    f"<br>injection interval {interval}"
+                    f"<br>reports {p['first injection report']} to {p['last injection report']}"
+                    f"<br>pressure reports: {p['pressure reports']}", max_width=320)).add_to(g)
+        g.add_to(m)
+        rows.append((f"<span style='display:inline-block;width:0;height:0;margin:0 6px;"
+                     f"border-left:6px solid transparent;border-right:6px solid transparent;"
+                     f"border-bottom:10px solid {c}'></span>",
+                     f"Injection wells reporting to TexNet ({len(wl.features)})"))
+    if eq.features:
+        c = TEXNET_STYLE["earthquake"]
+        g = folium.FeatureGroup(name=f"TexNet earthquakes, {eq.status} ({len(eq.features)})",
+                                show=True)
+        for f in eq.features:
+            lon, lat = f["geometry"]["coordinates"][:2]
+            p = f["properties"]
+            mag = float(p["magnitude"] or 0)
+            folium.CircleMarker(
+                [lat, lon], radius=3 + 2.5 * max(mag - 2.0, 0), color=c, weight=1,
+                fill=True, fill_opacity=0.55,
+                tooltip=f"M{mag:.1f} {p['date']}, {p['depth (km)']} km deep "
+                        f"({p['review status'] or 'snapshot'})").add_to(g)
+        g.add_to(m)
+        rows.append((f"<span style='display:inline-block;width:9px;height:9px;border-radius:50%;"
+                     f"border:1px solid {c};background:{c}88;margin:0 7px 0 6px'></span>",
+                     f"Earthquakes M{2:g}+ since 2017 ({len(eq.features)}, {eq.status})"))
+    if rows:
+        rows.append(("", f"<span style='color:#8a8983;font-size:11px'>Within "
+                         f"{near.distance_mi:g} mi of the AoR. TexNet, Bureau of Economic "
+                         f"Geology.</span>"))
+    return rows
+
+
 def build_map(result, ctx: MapContext, *, wells=None, penetrations=None,
               basemap: str = "satellite", title: str = "Area of Review",
               extra_geojson: dict | None = None, zoom_padding: float = 0.12,
-              fault_layers=None, fault_reach_deg: float = 0.35):
+              fault_layers=None, fault_reach_deg: float = 0.35, texnet=None):
     """Build a folium map of the AoR, its components, and the wells.
 
     ``result`` is an :class:`containment.delineate.AoRResult`; ``wells`` a list of
@@ -446,6 +518,7 @@ def build_map(result, ctx: MapContext, *, wells=None, penetrations=None,
         fault_rows = _add_fault_layers(m, list(fault_layers),
                           (centre[0][1] - pad, centre[0][0] - pad,
                            centre[1][1] + pad, centre[1][0] + pad))
+    texnet_rows = _add_texnet(m, texnet) if texnet is not None else []
 
     folium.LayerControl(collapsed=False).add_to(m)
     MeasureControl(primary_length_unit="feet", secondary_length_unit="miles",
@@ -479,7 +552,7 @@ def build_map(result, ctx: MapContext, *, wells=None, penetrations=None,
             window.addEventListener("resize", refit);
         }})();"""))
     m.get_root().html.add_child(folium.Element(
-        _legend_html(result, penetrations, ctx, title, fault_rows)))
+        _legend_html(result, penetrations, ctx, title, fault_rows, texnet_rows)))
     return m
 
 
