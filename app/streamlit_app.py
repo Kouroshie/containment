@@ -36,6 +36,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "src"))
 # harness need not, so the sibling modules below get it explicitly.
 sys.path.insert(0, _HERE)
 
+
+def _drop_stale_package_modules() -> None:
+    """Forget the containment modules if their source changed since they were imported.
+
+    A hosted server (Streamlit Community Cloud) pulls a new commit into the
+    running process and reruns this script, but Streamlit only reloads modules
+    inside app/; the package in src/ stays as first imported. A rerun then
+    calls new page code against old modules (seen 2026-11-19: build_map() got
+    an unexpected keyword argument). Comparing the source files' modification
+    times on each rerun costs a few milliseconds."""
+    src = os.path.join(os.path.dirname(_HERE), "src", "containment")
+    sig = []
+    for root, _dirs, files in os.walk(src):
+        sig += [(os.path.join(root, f), os.path.getmtime(os.path.join(root, f)))
+                for f in files if f.endswith(".py")]
+    sig = tuple(sorted(sig))
+    seen = getattr(sys, "_containment_src_sig", None)
+    if seen is None:
+        # first rerun of this script in the process: the modules are stale only
+        # if a file changed after the process started (Linux /proc gives that)
+        try:
+            started = os.stat(f"/proc/{os.getpid()}").st_ctime
+        except OSError:
+            started = None
+        stale = started is not None and any(t > started for _f, t in sig)
+    else:
+        stale = seen != sig
+    if stale:
+        for name in [n for n in sys.modules if n == "containment" or n.startswith("containment.")]:
+            del sys.modules[name]
+    sys._containment_src_sig = sig
+
+
+_drop_stale_package_modules()
+
 import guide  # noqa: E402  (sibling module: help text)
 import theme  # noqa: E402  (sibling module: page styling)
 import threshold_help  # noqa: E402  (sibling module: threshold method explanations)
