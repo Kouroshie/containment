@@ -377,3 +377,19 @@ def test_legend_lists_the_fault_layers_drawn():
     assert "Mapped faults and earthquakes" in html
     assert any(f"{n} (" in html for n in gis.FAULT_LEGEND_NAMES.values())
     assert "Mapped faults and earthquakes" not in gis.map_html(_disc(), ctx, wells=p.wells)
+
+
+@pytest.mark.skipif(not gis.HAVE_FOLIUM, reason="folium not installed")
+def test_map_draws_live_texnet_data_with_a_legend():
+    from test_texnet import fake
+
+    from containment import texnet as TX
+    p = _project()
+    ctx = gis.MapContext.from_project(p)
+    res = _disc()
+    tx = TX.near(gis.aor_lonlat(res, ctx), 5.0, fetch=fake)
+    html = gis.map_html(res, ctx, wells=p.wells, texnet=tx)
+    assert "TexNet near the AoR" in html
+    assert "Injection wells reporting to TexNet (2)" in html
+    assert "UIC 000000001" in html
+    assert "TexNet near the AoR" not in gis.map_html(res, ctx, wells=p.wells)
