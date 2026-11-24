@@ -125,7 +125,7 @@ def _ms_date(v) -> str:
     if v in (None, ""):
         return ""
     try:
-        return _dt.datetime.fromtimestamp(float(v) / 1000.0, _dt.UTC).date().isoformat()
+        return _dt.datetime.fromtimestamp(float(v) / 1000.0, _dt.timezone.utc).date().isoformat()
     except (TypeError, ValueError, OverflowError, OSError):
         return ""
 
@@ -207,7 +207,7 @@ def statewide_earthquakes(min_magnitude: float = 2.0, fetch=get_json,
                           timeout: float = 30.0) -> list[dict]:
     """Every TexNet event since 2017 at or above ``min_magnitude`` (cached an hour)."""
     def go():
-        end = (_dt.datetime.now(_dt.UTC) + _dt.timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        end = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
         q = urllib.parse.urlencode({"start": CATALOG_START + "T00:00:00Z", "end": end,
                                     "minmag": min_magnitude, "maxmag": 10,
                                     "mindepth": 0, "maxdepth": 999})
@@ -241,7 +241,7 @@ def earthquakes_near(aor_lonlat, distance_mi: float = 5.0, min_magnitude: float 
     try:
         events = statewide_earthquakes(min_magnitude, fetch=fetch)
         part.status = "live"
-        part.fetched = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+        part.fetched = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception as e:  # noqa: BLE001  network, TLS, JSON: fall back to the snapshot
         part.error = f"{type(e).__name__}: {e}"
         events = _snapshot_events()
@@ -329,7 +329,7 @@ def injection_wells_near(aor_lonlat, distance_mi: float = 5.0, fetch=get_json) -
         part.error = f"{type(e).__name__}: {e}"
         return part
     part.status = "live"
-    part.fetched = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+    part.fetched = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     pmap = {(f.get("properties") or {}).get("UICNumber"): f.get("properties") or {} for f in pres}
     for f in wells:
         g, p = f.get("geometry"), f.get("properties") or {}
@@ -449,7 +449,7 @@ def seismic_areas_near(aor_lonlat, distance_mi: float = 5.0, fetch=get_json) -> 
                                   "properties": row})
     if got_any:
         part.status = "live"
-        part.fetched = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+        part.fetched = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     part.error = "; ".join(errors)
     order = {"AoR inside": 0, "overlaps the AoR": 1, "nearby": 2}
     part.rows.sort(key=lambda r: (order[r["relation"]], r["distance from the AoR (mi)"]))
